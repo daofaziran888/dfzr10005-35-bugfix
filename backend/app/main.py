@@ -32,6 +32,13 @@ def health() -> dict[str, object]:
     return {"ok": True, "app": settings.app_name, "modules": len(store.module_names())}
 
 
+@app.post("/api/_simulate/write-failure")
+def simulate_write_failure(module: str, enabled: bool = True) -> dict[str, object]:
+    """本地演练开关：模拟指定模块落库失败，用来验证业务动作不会显示成功。"""
+    store.fail_module(module, enabled)
+    return {"ok": True, "module": module, "write_failure": enabled}
+
+
 @app.get("/api/overview")
 def overview() -> dict[str, object]:
     """运营概览：把各业务模块的待处理量汇总成看板卡片。"""

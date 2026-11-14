@@ -22,10 +22,23 @@ class ActionResult(BaseModel):
 
 
 class EntryPayload(BaseModel):
-    """登记或修改一条业务记录时提交的字段集合。"""
+    """登记或修改一条业务记录时提交的字段集合。
+
+    action/operator/remark 平铺在请求体里，是为了让前端按钮直接提交
+    `{ "action": "标记复核" }`；values 仍然保留给批量字段场景。
+    """
 
     values: dict[str, Any] = Field(default_factory=dict)
     remark: str | None = None
+    action: str | None = None
+    operator: str | None = None
+    expected_version: int | None = None
+
+    def action_name(self) -> str:
+        return str(self.action or self.values.get("action") or "").strip()
+
+    def operator_name(self) -> str:
+        return str(self.operator or self.values.get("操作人") or "值班管理员").strip()
 
 
 

@@ -2,17 +2,30 @@
   <section class="page" data-module="lifecycle">
     <header class="page-head">
       <div>
-        <h2>表生命周期管理管理</h2>
-        <p class="page-desc">维护数仓表的生命周期策略定义、归档路径与清理方式，为表生命周期管理提供可验证的数据工程流程。</p>
+        <h2>表生命周期管理</h2>
+        <p class="page-desc">
+          维护数仓表的生命周期策略、归档路径与清理方式；每次动作都写入一条审计事件，
+          前后值与操作人、操作时间保存在同一条记录里。
+        </p>
       </div>
       <div class="page-actions">
         <button class="btn primary" type="button" @click="openCreate">登记生命周期策略</button>
         <button class="btn" type="button" @click="exportRows">导出表生命周期管理清单</button>
+        <button class="btn ghost" type="button" @click="loadGovernance">核对生命周期治理清单</button>
       </div>
     </header>
 
+    <form v-if="creating" class="create-form" @submit.prevent="submitCreate">
+      <label v-for="field in createFields" :key="field" class="filter-item">
+        <span>{{ field }}</span>
+        <input v-model="createValues[field]" :placeholder="field" />
+      </label>
+      <button class="btn primary" type="submit" :disabled="submitting">提交登记</button>
+      <button class="btn ghost" type="button" @click="creating = false">取消</button>
+    </form>
+
     <div class="stat-row">
-      <article v-for="item in stats" :key="item.label" class="stat-card">
+      <article v-for="item in statCards" :key="item.label" class="stat-card">
         <span class="stat-label">{{ item.label }}</span>
         <strong class="stat-value">{{ item.value }}</strong>
       </article>
@@ -23,6 +36,13 @@
         <span>{{ field }}</span>
         <input v-model="filters[field]" :placeholder="`按${field}检索`" />
       </label>
+      <label class="filter-item">
+        <span>策略状态</span>
+        <select v-model="statusFilter">
+          <option value="">全部状态</option>
+          <option v-for="status in statuses" :key="status" :value="status">{{ status }}</option>
+        </select>
+      </label>
       <button class="btn" type="submit">查询</button>
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
     </form>
@@ -31,58 +51,148 @@
       <thead>
         <tr>
           <th v-for="column in columns" :key="column">{{ column }}</th>
+          <th>来源事件</th>
           <th>可执行动作</th>
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)">
+        <tr v-for="row in rows" :key="String(row.id)" :class="{ 'row-selected': selectedId === row.id }">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
+          <td class="source-cell">
+            <button class="link" type="button" @click="openDetail(row)">
+              {{ row['来源事件编号'] ?? '尚无来源事件' }}
+            </button>
+            <span v-if="row['只读']" class="readonly-tag">只读</span>
+            <span v-if="row['版本'] !== undefined" class="source-note">对象版本 v{{ row['版本'] }}</span>
+          </td>
           <td class="row-actions">
             <button
-              v-for="action in actions"
+              v-for="action in actionFor(row)"
               :key="action"
               class="link"
               type="button"
+              :disabled="isRunning(row.id, action)"
               @click="runAction(action, row)"
             >
-              {{ action }}
+              {{ isRunning(row.id, action) ? '处理中…' : action }}
             </button>
+            <span v-if="row['只读']" class="readonly-note">已归档，不再接受业务动作</span>
           </td>
         </tr>
-        <tr v-if="!rows.length">
-          <td :colspan="columns.length + 1" class="empty-state">暂无表生命周期管理数据，可先登记生命周期策略</td>
+        <tr v-if="!rows.length && !loading">
+          <td :colspan="columns.length + 2" class="empty-state">暂无表生命周期管理数据，可先登记生命周期策略</td>
+        </tr>
+        <tr v-if="loading">
+          <td :colspan="columns.length + 2" class="empty-state">正在读取生命周期策略…</td>
         </tr>
       </tbody>
     </table>
 
     <footer class="page-foot">
       <span>共 {{ total }} 条表生命周期管理记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span v-if="messageText" :class="messageKind === 'error' ? 'error-text' : 'ok-text'">{{ messageText }}</span>
     </footer>
+
+    <SourceEventsPanel v-if="selectedId !== null" endpoint="/api/lifecycle" :entry-id="selectedId" />
+
+    <section v-if="governance" class="detail-panel" data-panel="lifecycle-governance">
+      <header class="detail-head">
+        <div>
+          <h3>生命周期治理清单</h3>
+          <p class="detail-desc">
+            共 {{ governance['total'] }} 条来源事件：已记录 {{ governance['recorded'] }}、
+            已复核 {{ governance['reviewed'] }}、已归档 {{ governance['archived'] }}。
+            清单直接读取审计事件，不用业务现值回填前后值。
+          </p>
+        </div>
+        <button class="btn ghost" type="button" @click="governance = null">收起清单</button>
+      </header>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>记录编号</th><th>变更对象</th><th>变更类型</th><th>变更前值</th><th>变更后值</th>
+            <th>复核状态</th><th>操作人</th><th>操作时间</th><th>指纹校验</th><th>缺失项</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in governance['items'] as Row[]" :key="String(item.id)">
+            <td>{{ item['记录编号'] }}</td>
+            <td>{{ item['变更对象'] }}</td>
+            <td>{{ item['变更类型'] }}</td>
+            <td>{{ item['变更前值'] ?? '—' }}</td>
+            <td>{{ item['变更后值'] ?? '—' }}</td>
+            <td>{{ item['复核状态'] }}<span v-if="item['只读']" class="readonly-tag">只读</span></td>
+            <td>{{ item['操作人'] }}</td>
+            <td>{{ item['操作时间'] }}</td>
+            <td :class="item['指纹校验'] === '指纹一致' ? 'ok-text' : ''">{{ item['指纹校验'] }}</td>
+            <td :class="(item['缺失项'] as string[] | undefined)?.length ? 'missing-text' : ''">
+              {{ (item['缺失项'] as string[] | undefined)?.join('、') || '—' }}
+            </td>
+          </tr>
+          <tr v-if="!(governance['items'] as Row[]).length">
+            <td colspan="10" class="empty-state">该模块暂无审计事件</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
+import SourceEventsPanel from '@/components/SourceEventsPanel.vue'
 import { request } from '@/api/client'
 
-type Row = Record<string, string | number | null>
+type Row = Record<string, any>
 
 const ENDPOINT = '/api/lifecycle'
-const columns = ["策略编号", "表名称", "创建日期", "保留天数", "归档路径", "清理方式", "最后操作", "策略状态"]
-const actions = ["启用策略", "归档表", "删除表"]
-const statuses = ["草稿", "生效中", "已到期", "已归档"]
-const stats = [{"label": "生命周期策略总数", "value": 0}, {"label": "生效中策略", "value": 0}, {"label": "已到期策略", "value": 0}]
+const columns = ['策略编号', '表名称', '创建日期', '保留天数', '归档路径', '清理方式', '最后操作', '策略状态']
+const statuses = ['草稿', '生效中', '已到期', '已归档']
+const createFields = ['策略编号', '表名称', '创建日期']
+const ACTIONS: Record<string, { from: string[]; to: string }> = {
+  启用策略: { from: ['草稿'], to: '生效中' },
+  归档表: { from: ['生效中', '已到期'], to: '已归档' },
+  删除表: { from: ['生效中'], to: '已到期' },
+}
 
 const rows = ref<Row[]>([])
 const total = ref(0)
-const errorMessage = ref('')
+const loading = ref(false)
+const messageText = ref('')
+const messageKind = ref<'ok' | 'error'>('ok')
 const filters = ref<Record<string, string>>({})
+const statusFilter = ref('')
 const filterFields = columns.slice(0, 3)
+const selectedId = ref<number | null>(null)
+const runningKeys = ref<Set<string>>(new Set())
+const creating = ref(false)
+const submitting = ref(false)
+const createValues = ref<Record<string, string>>({})
+const governance = ref<Row | null>(null)
+
+const statCards = computed(() => [
+  { label: '生命周期策略总数', value: total.value },
+  { label: '生效中策略', value: rows.value.filter((row) => row['策略状态'] === '生效中' || row['status'] === '生效中').length },
+  { label: '已到期策略', value: rows.value.filter((row) => row['策略状态'] === '已到期' || row['status'] === '已到期').length },
+  { label: '已归档策略', value: rows.value.filter((row) => row['只读']).length },
+])
+
+function actionFor(row: Row) {
+  if (row['只读']) return []
+  const current = String(row['status'] ?? '')
+  return Object.entries(ACTIONS)
+    .filter(([, rule]) => rule.from.includes(current) && rule.to !== current)
+    .map(([action]) => action)
+}
+
+function isRunning(id: number, action: string) {
+  return runningKeys.value.has(`${id}:${action}`)
+}
 
 function resetFilters() {
   filters.value = {}
+  statusFilter.value = ''
   void reload()
 }
 
@@ -91,40 +201,114 @@ function exportRows() {
 }
 
 function openCreate() {
-  errorMessage.value = '生命周期策略登记入口尚未接入审批流'
+  createValues.value = {}
+  creating.value = true
+  messageText.value = ''
+}
+
+async function submitCreate() {
+  submitting.value = true
+  messageText.value = ''
+  try {
+    const response = await request(ENDPOINT, {
+      method: 'POST',
+      body: JSON.stringify({ values: createValues.value }),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) throw new Error(payload.message ?? '生命周期策略登记失败')
+    messageKind.value = 'ok'
+    messageText.value = payload.message
+    creating.value = false
+    await reload()
+  } catch (error) {
+    messageKind.value = 'error'
+    messageText.value = error instanceof Error ? error.message : '生命周期策略登记失败'
+  } finally {
+    submitting.value = false
+  }
 }
 
 async function runAction(action: string, row: Row) {
-  errorMessage.value = ''
+  const key = `${row.id}:${action}`
+  if (runningKeys.value.has(key)) return
+  runningKeys.value.add(key)
+  messageText.value = ''
   try {
     const response = await request(`${ENDPOINT}/${row.id}/actions`, {
       method: 'POST',
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, expected_version: row['版本'] }),
     })
-    if (!response.ok) {
-      throw new Error('表生命周期管理动作未生效，请稍后重试')
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      // 落库失败 / 版本过期 / 状态不允许：必须如实显示失败，不能刷新成成功。
+      throw new Error(payload.message ?? '表生命周期管理动作未生效')
     }
+    messageKind.value = 'ok'
+    messageText.value = payload.message ?? ''
     await reload()
+    if (selectedId.value === row.id) {
+      await openDetail({ ...row, id: row.id })
+    }
+    if (governance.value) {
+      await loadGovernance()
+    }
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '表生命周期管理操作失败'
+    messageKind.value = 'error'
+    messageText.value = error instanceof Error ? error.message : '表生命周期管理操作失败'
+    await reload()
+  } finally {
+    runningKeys.value.delete(key)
+    runningKeys.value = new Set(runningKeys.value)
+  }
+}
+
+function openDetail(row: Row) {
+  selectedId.value = Number(row.id)
+}
+
+async function loadGovernance() {
+  try {
+    const response = await request(`${ENDPOINT}/governance`)
+    if (!response.ok) throw new Error('生命周期治理清单读取失败')
+    governance.value = await response.json()
+  } catch (error) {
+    messageKind.value = 'error'
+    messageText.value = error instanceof Error ? error.message : '生命周期治理清单读取失败'
   }
 }
 
 async function reload() {
-  errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  messageText.value = ''
+  loading.value = true
+  const query = new URLSearchParams({ ...filters.value, status: statusFilter.value }).toString()
   try {
     const response = await request(`${ENDPOINT}?${query}`)
-    if (!response.ok) {
-      throw new Error('生命周期策略列表读取失败')
-    }
+    if (!response.ok) throw new Error('生命周期策略列表读取失败')
     const payload = await response.json()
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '表生命周期管理列表读取失败'
+    messageKind.value = 'error'
+    messageText.value = error instanceof Error ? error.message : '表生命周期管理列表读取失败'
+  } finally {
+    loading.value = false
   }
 }
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.create-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+.detail-panel { margin-top: 16px; background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+.detail-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }
+.detail-head h3 { margin: 0; font-size: 15px; }
+.detail-desc { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+.row-selected { background: #f3f7ff; }
+.source-cell { font-size: 12px; }
+.source-note { display: block; color: var(--muted); }
+.readonly-tag { margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: #eef2f7; color: #475569; font-size: 11px; }
+.readonly-note { font-size: 11px; color: var(--muted); }
+.missing-text { color: #b42318; }
+.ok-text { color: #067647; }
+</style>
